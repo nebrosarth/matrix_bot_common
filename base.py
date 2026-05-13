@@ -28,9 +28,11 @@ from nio import (
     KeyVerificationMac,
     KeyVerificationStart,
     LocalProtocolError,
+    LoginResponse,
     ToDeviceError,
     ToDeviceEvent,
     ToDeviceMessage,
+    WhoamiError,
 )
 
 
@@ -161,43 +163,77 @@ class MatrixBot:
 
     # ---- Main loop ----
 
+    def _save_session(self, response: LoginResponse) -> None:
+        with open(self.session_path, "w") as f:
+            json.dump(
+                {
+                    "access_token": response.access_token,
+                    "device_id": response.device_id,
+                    "user_id": response.user_id,
+                },
+                f,
+            )
+
+    def _delete_session(self) -> None:
+        try:
+            os.remove(self.session_path)
+        except FileNotFoundError:
+            pass
+
+    async def _login_fresh(self, config: AsyncClientConfig) -> None:
+        """Чистый логин по паролю + сохранение session.json."""
+        self.client = AsyncClient(
+            self.homeserver, self.user_id, store_path=self.store_path, config=config
+        )
+        response = await self.client.login(self.password, device_name=self.name)
+        if not isinstance(response, LoginResponse):
+            raise RuntimeError(f"login failed: {response}")
+        self._save_session(response)
+
+    async def _try_restore_session(self, config: AsyncClientConfig) -> bool:
+        """Восстановить клиента из session.json и проверить токен через whoami().
+        Возвращает True, если токен валиден. False — если нужно делать fresh-login."""
+        if not (os.path.exists(self.session_path) and os.path.getsize(self.session_path) > 0):
+            return False
+        try:
+            with open(self.session_path) as f:
+                session = json.load(f)
+        except Exception as e:
+            print(f"[{self.name}] session.json повреждён ({e}); удаляю.")
+            self._delete_session()
+            return False
+
+        self.client = AsyncClient(
+            self.homeserver,
+            session["user_id"],
+            device_id=session["device_id"],
+            store_path=self.store_path,
+            config=config,
+        )
+        self.client.access_token = session["access_token"]
+        self.client.user_id = session["user_id"]
+        self.client.device_id = session["device_id"]
+
+        # Проверка живости токена.
+        resp = await self.client.whoami()
+        if isinstance(resp, WhoamiError):
+            print(f"[{self.name}] session.json протух ({resp}); делаю fresh-login.")
+            await self.client.close()
+            self._delete_session()
+            return False
+        return True
+
     async def run(self) -> None:
         config = AsyncClientConfig(store_sync_tokens=True, encryption_enabled=True)
 
-        if os.path.exists(self.session_path) and os.path.getsize(self.session_path) > 0:
-            with open(self.session_path) as f:
-                session = json.load(f)
-            self.client = AsyncClient(
-                self.homeserver,
-                session["user_id"],
-                device_id=session["device_id"],
-                store_path=self.store_path,
-                config=config,
-            )
-            self.client.access_token = session["access_token"]
-            self.client.user_id = session["user_id"]
-        else:
-            self.client = AsyncClient(
-                self.homeserver, self.user_id, store_path=self.store_path, config=config
-            )
-            response = await self.client.login(self.password)
-            with open(self.session_path, "w") as f:
-                json.dump(
-                    {
-                        "access_token": response.access_token,
-                        "device_id": response.device_id,
-                        "user_id": response.user_id,
-                    },
-                    f,
-                )
+        # Сначала пробуем восстановить сессию, иначе — fresh login. БЕЗ двойного логина.
+        if not await self._try_restore_session(config):
+            await self._login_fresh(config)
 
         if self.client.should_upload_keys:
             await self.client.keys_upload()
 
         self.client.encryption_trust_level = "unverified"
-
-        # Свежий токен — гарантирует, что persisted session.json не протух.
-        await self.client.login(self.password)
 
         # Общие колбэки.
         self.client.add_event_callback(self._invite_callback, InviteEvent)
@@ -207,8 +243,11 @@ class MatrixBot:
         # Хук для подкласса (регистрация специфичных обработчиков).
         await self.on_start()
 
-        print(f"[{self.name}] запущен (E2EE).")
-        await self.client.sync_forever(timeout=30000, full_state=True)
+        print(f"[{self.name}] запущен (E2EE), device_id={self.client.device_id}")
+        try:
+            await self.client.sync_forever(timeout=30000, full_state=True)
+        finally:
+            await self.client.close()
 
     def main(self) -> None:
         """Удобный entry-point: asyncio.run(self.run()) с обработкой Ctrl+C."""
