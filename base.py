@@ -180,14 +180,35 @@ class MatrixBot:
         except FileNotFoundError:
             pass
 
+    def _read_old_device_id(self) -> str | None:
+        """Достать device_id из существующего session.json (для переиспользования при пере-логине)."""
+        if not os.path.exists(self.session_path):
+            return None
+        try:
+            with open(self.session_path) as f:
+                return json.load(f).get("device_id")
+        except Exception:
+            return None
+
     async def _login_fresh(self, config: AsyncClientConfig) -> None:
-        """Чистый логин по паролю + сохранение session.json."""
+        """Логин по паролю. Если есть старый device_id — переиспользуем его,
+        чтобы homeserver не плодил новые устройства на каждом рестарте."""
+        old_device_id = self._read_old_device_id()
         self.client = AsyncClient(
-            self.homeserver, self.user_id, store_path=self.store_path, config=config
+            self.homeserver,
+            self.user_id,
+            device_id=old_device_id,  # None при первом запуске — сервер сгенерит свой
+            store_path=self.store_path,
+            config=config,
         )
         response = await self.client.login(self.password, device_name=self.name)
         if not isinstance(response, LoginResponse):
             raise RuntimeError(f"login failed: {response}")
+        if old_device_id and response.device_id != old_device_id:
+            print(
+                f"[{self.name}] WARN: homeserver выдал новый device_id "
+                f"({response.device_id} вместо {old_device_id})"
+            )
         self._save_session(response)
 
     async def _try_restore_session(self, config: AsyncClientConfig) -> bool:
@@ -217,9 +238,9 @@ class MatrixBot:
         # Проверка живости токена.
         resp = await self.client.whoami()
         if isinstance(resp, WhoamiError):
-            print(f"[{self.name}] session.json протух ({resp}); делаю fresh-login.")
+            print(f"[{self.name}] токен протух ({resp}); делаю пере-логин с тем же device_id.")
             await self.client.close()
-            self._delete_session()
+            # session.json НЕ удаляем — _login_fresh прочитает device_id оттуда.
             return False
         return True
 
