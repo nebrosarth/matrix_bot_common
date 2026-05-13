@@ -29,10 +29,10 @@ from nio import (
     KeyVerificationStart,
     LocalProtocolError,
     LoginResponse,
+    MegolmEvent,
     ToDeviceError,
     ToDeviceEvent,
     ToDeviceMessage,
-    WhoamiError,
 )
 
 
@@ -88,6 +88,20 @@ class MatrixBot:
     async def _invite_callback(self, room, event):
         print(f"[{self.name}] Приглашение в комнату {room.room_id}. Принимаю...")
         await self.client.join(room.room_id)
+
+    async def _undecryptable_callback(self, room, event):
+        """Не смогли расшифровать megolm-событие → попросить отправителя
+        переотправить нам room key."""
+        if not isinstance(event, MegolmEvent):
+            return
+        print(
+            f"[{self.name}] не смог расшифровать событие {event.event_id} от {event.sender}, "
+            f"запрашиваю room key..."
+        )
+        try:
+            await self.client.request_room_key(event)
+        except Exception as e:
+            print(f"[{self.name}] request_room_key failed: {e}")
 
     async def _device_verification_callback(self, event):
         """Auto-accept SAS (emoji) device verification."""
@@ -174,12 +188,6 @@ class MatrixBot:
                 f,
             )
 
-    def _delete_session(self) -> None:
-        try:
-            os.remove(self.session_path)
-        except FileNotFoundError:
-            pass
-
     def _read_old_device_id(self) -> str | None:
         """Достать device_id из существующего session.json (для переиспользования при пере-логине)."""
         if not os.path.exists(self.session_path):
@@ -211,45 +219,13 @@ class MatrixBot:
             )
         self._save_session(response)
 
-    async def _try_restore_session(self, config: AsyncClientConfig) -> bool:
-        """Восстановить клиента из session.json и проверить токен через whoami().
-        Возвращает True, если токен валиден. False — если нужно делать fresh-login."""
-        if not (os.path.exists(self.session_path) and os.path.getsize(self.session_path) > 0):
-            return False
-        try:
-            with open(self.session_path) as f:
-                session = json.load(f)
-        except Exception as e:
-            print(f"[{self.name}] session.json повреждён ({e}); удаляю.")
-            self._delete_session()
-            return False
-
-        self.client = AsyncClient(
-            self.homeserver,
-            session["user_id"],
-            device_id=session["device_id"],
-            store_path=self.store_path,
-            config=config,
-        )
-        self.client.access_token = session["access_token"]
-        self.client.user_id = session["user_id"]
-        self.client.device_id = session["device_id"]
-
-        # Проверка живости токена.
-        resp = await self.client.whoami()
-        if isinstance(resp, WhoamiError):
-            print(f"[{self.name}] токен протух ({resp}); делаю пере-логин с тем же device_id.")
-            await self.client.close()
-            # session.json НЕ удаляем — _login_fresh прочитает device_id оттуда.
-            return False
-        return True
-
     async def run(self) -> None:
         config = AsyncClientConfig(store_sync_tokens=True, encryption_enabled=True)
 
-        # Сначала пробуем восстановить сессию, иначе — fresh login. БЕЗ двойного логина.
-        if not await self._try_restore_session(config):
-            await self._login_fresh(config)
+        # Стратегия: всегда делаем свежий логин (он переиспользует device_id из
+        # session.json, так что устройство на homeserver стабильно). Это надёжнее,
+        # чем пытаться валидировать старый access_token — homeserver мог его рециклить.
+        await self._login_fresh(config)
 
         if self.client.should_upload_keys:
             await self.client.keys_upload()
@@ -258,6 +234,7 @@ class MatrixBot:
 
         # Общие колбэки.
         self.client.add_event_callback(self._invite_callback, InviteEvent)
+        self.client.add_event_callback(self._undecryptable_callback, MegolmEvent)
         self.client.add_event_callback(self._device_verification_callback, (KeyVerificationEvent,))
         self.client.add_to_device_callback(self._device_verification_callback, (ToDeviceEvent,))
 
