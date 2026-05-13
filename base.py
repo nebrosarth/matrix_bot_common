@@ -27,6 +27,7 @@ from nio import (
     KeyVerificationKey,
     KeyVerificationMac,
     KeyVerificationStart,
+    KeysUploadError,
     LocalProtocolError,
     LoginResponse,
     MegolmEvent,
@@ -227,8 +228,30 @@ class MatrixBot:
         # чем пытаться валидировать старый access_token — homeserver мог его рециклить.
         await self._login_fresh(config)
 
-        if self.client.should_upload_keys:
-            await self.client.keys_upload()
+        # Диагностика E2EE.
+        olm = getattr(self.client, "olm", None)
+        if olm is None:
+            print(
+                f"[{self.name}] КРИТИЧНО: client.olm == None. matrix-nio[e2e] не работает. "
+                f"Проверь: pip show matrix-nio | grep -i extras; ldconfig -p | grep olm"
+            )
+        else:
+            ident = olm.account.identity_keys
+            print(f"[{self.name}] olm identity keys: curve25519={ident.get('curve25519')[:16]}... "
+                  f"ed25519={ident.get('ed25519')[:16]}...")
+
+        # Принудительный keys_upload — даже если should_upload_keys=False, на всякий случай.
+        # Иначе Element видит сессию как «not E2EE» и не даёт верифицировать.
+        should = getattr(self.client, "should_upload_keys", None)
+        print(f"[{self.name}] should_upload_keys={should}")
+        try:
+            resp = await self.client.keys_upload()
+            if isinstance(resp, KeysUploadError):
+                print(f"[{self.name}] keys_upload ОШИБКА: {resp}")
+            else:
+                print(f"[{self.name}] keys_upload OK: {resp}")
+        except Exception as e:
+            print(f"[{self.name}] keys_upload exception: {e}")
 
         self.client.encryption_trust_level = "unverified"
 
