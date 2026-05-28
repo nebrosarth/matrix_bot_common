@@ -268,6 +268,13 @@ class MatrixBot:
         self.client.access_token = session["access_token"]
         self.client.user_id = session["user_id"]
         self.client.device_id = session["device_id"]
+        # КРИТИЧНО: вручную загружаем olm-аккаунт и crypto-store с диска.
+        # login() делает это автоматически, но мы его пропускаем чтобы не ломать сессии.
+        try:
+            self.client.load_store()
+        except Exception as e:
+            print(f"[{self.name}] load_store() failed ({e}); делаю fresh login.")
+            return False
         print(f"[{self.name}] восстановлена сессия из {self.session_path} (без re-login)")
         return True
 
