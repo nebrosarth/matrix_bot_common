@@ -90,19 +90,38 @@ class MatrixBot:
         print(f"[{self.name}] Приглашение в комнату {room.room_id}. Принимаю...")
         await self.client.join(room.room_id)
 
+    async def _refresh_olm_for_user(self, user_id: str) -> None:
+        """Принудительно освежить device list и one-time keys для пользователя.
+        Помогает пересоздать broken olm-сессию (типичная беда после ребута)."""
+        try:
+            await self.client.keys_query()
+        except Exception as e:
+            print(f"[{self.name}] keys_query({user_id}) failed: {e}")
+            return
+        user_devices = (self.client.device_store.users.get(user_id) or {})
+        device_ids = list(user_devices.keys())
+        if not device_ids:
+            return
+        try:
+            await self.client.keys_claim({user_id: device_ids})
+            print(f"[{self.name}] keys_claim для {user_id}: {len(device_ids)} устройств")
+        except Exception as e:
+            print(f"[{self.name}] keys_claim({user_id}) failed: {e}")
+
     async def _undecryptable_callback(self, room, event):
-        """Не смогли расшифровать megolm-событие → попросить отправителя
-        переотправить нам room key."""
+        """Не смогли расшифровать megolm-событие → запрашиваем room key И
+        пересоздаём olm-сессию с отправителем (на случай если она «протухла»)."""
         if not isinstance(event, MegolmEvent):
             return
         print(
             f"[{self.name}] не смог расшифровать событие {event.event_id} от {event.sender}, "
-            f"запрашиваю room key..."
+            f"запрашиваю room key + пересоздаю olm..."
         )
         try:
             await self.client.request_room_key(event)
         except Exception as e:
             print(f"[{self.name}] request_room_key failed: {e}")
+        await self._refresh_olm_for_user(event.sender)
 
     async def _device_verification_callback(self, event):
         """Auto-accept SAS (emoji) device verification."""
@@ -264,11 +283,53 @@ class MatrixBot:
         # Хук для подкласса (регистрация специфичных обработчиков).
         await self.on_start()
 
+        # Делаем один начальный sync, чтобы получить список комнат и членов.
+        # full_state=True заполняет device_store через первые keys_query.
+        print(f"[{self.name}] первый sync...")
+        await self.client.sync(timeout=10000, full_state=True)
+
+        # Bootstrap olm-сессий со всеми членами E2EE-комнат. Это лечит «протухшие»
+        # olm-сессии после ребута: новые keys_claim создают свежую сессию, и Element
+        # дальше будет шарить room keys через неё.
+        await self._bootstrap_olm()
+
         print(f"[{self.name}] запущен (E2EE), device_id={self.client.device_id}")
         try:
             await self.client.sync_forever(timeout=30000, full_state=True)
         finally:
             await self.client.close()
+
+    async def _bootstrap_olm(self) -> None:
+        """Освежить device list и pre-claim one-time keys для всех участников
+        E2EE-комнат бота. Делает рестарт устойчивым к broken olm-сессиям."""
+        try:
+            await self.client.keys_query()
+        except Exception as e:
+            print(f"[{self.name}] bootstrap keys_query failed: {e}")
+            return
+
+        devices_by_user: dict[str, list[str]] = {}
+        for room in self.client.rooms.values():
+            if not getattr(room, "encrypted", False):
+                continue
+            for uid in room.users:
+                if uid == self.client.user_id:
+                    continue
+                user_devices = self.client.device_store.users.get(uid) or {}
+                for did in user_devices.keys():
+                    devices_by_user.setdefault(uid, []).append(did)
+
+        if not devices_by_user:
+            print(f"[{self.name}] olm bootstrap: нет участников E2EE-комнат")
+            return
+
+        total = sum(len(v) for v in devices_by_user.values())
+        print(f"[{self.name}] olm bootstrap: keys_claim для {total} устройств "
+              f"({len(devices_by_user)} пользователей)")
+        try:
+            await self.client.keys_claim(devices_by_user)
+        except Exception as e:
+            print(f"[{self.name}] bootstrap keys_claim failed: {e}")
 
     def main(self) -> None:
         """Удобный entry-point: asyncio.run(self.run()) с обработкой Ctrl+C."""
