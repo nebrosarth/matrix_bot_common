@@ -90,6 +90,14 @@ class MatrixBot:
         print(f"[{self.name}] Приглашение в комнату {room.room_id}. Принимаю...")
         await self.client.join(room.room_id)
 
+    def _devices_of(self, user_id: str) -> list[str]:
+        """Список device_id юзера из локального device_store (пусто, если юзер неизвестен)."""
+        try:
+            user_devices = self.client.device_store[user_id]
+        except KeyError:
+            return []
+        return list(user_devices.keys())
+
     async def _refresh_olm_for_user(self, user_id: str) -> None:
         """Принудительно освежить device list и one-time keys для пользователя.
         Помогает пересоздать broken olm-сессию (типичная беда после ребута)."""
@@ -98,8 +106,7 @@ class MatrixBot:
         except Exception as e:
             print(f"[{self.name}] keys_query({user_id}) failed: {e}")
             return
-        user_devices = (self.client.device_store.users.get(user_id) or {})
-        device_ids = list(user_devices.keys())
+        device_ids = self._devices_of(user_id)
         if not device_ids:
             return
         try:
@@ -315,9 +322,9 @@ class MatrixBot:
             for uid in room.users:
                 if uid == self.client.user_id:
                     continue
-                user_devices = self.client.device_store.users.get(uid) or {}
-                for did in user_devices.keys():
-                    devices_by_user.setdefault(uid, []).append(did)
+                dids = self._devices_of(uid)
+                if dids:
+                    devices_by_user[uid] = dids
 
         if not devices_by_user:
             print(f"[{self.name}] olm bootstrap: нет участников E2EE-комнат")
