@@ -355,24 +355,33 @@ class MatrixBot:
             await self.client.close()
 
     async def _bootstrap_olm(self) -> None:
-        """Освежить device list и pre-claim one-time keys для всех участников
-        E2EE-комнат бота. Делает рестарт устойчивым к broken olm-сессиям."""
+        """Освежить device list, pre-claim one-time keys и принудительно создать
+        новую исходящую megolm-сессию в каждой E2EE-комнате. Сайд-эффект последнего —
+        свежие olm prekey-сообщения всем участникам, которые «лечат» разбежавшиеся
+        ratchet-состояния. Без этого Element после ребута сервера продолжает слать
+        room keys через старую сломанную olm-сессию."""
         try:
             await self.client.keys_query()
         except Exception as e:
             print(f"[{self.name}] bootstrap keys_query failed: {e}")
             return
 
+        encrypted_rooms = [
+            (rid, room) for rid, room in self.client.rooms.items()
+            if getattr(room, "encrypted", False)
+        ]
+
         devices_by_user: dict[str, list[str]] = {}
-        for room in self.client.rooms.values():
-            if not getattr(room, "encrypted", False):
-                continue
+        for _, room in encrypted_rooms:
             for uid in room.users:
                 if uid == self.client.user_id:
                     continue
                 dids = self._devices_of(uid)
                 if dids:
-                    devices_by_user[uid] = dids
+                    devices_by_user.setdefault(uid, [])
+                    for did in dids:
+                        if did not in devices_by_user[uid]:
+                            devices_by_user[uid].append(did)
 
         if not devices_by_user:
             print(f"[{self.name}] olm bootstrap: нет участников E2EE-комнат")
@@ -385,6 +394,19 @@ class MatrixBot:
             await self.client.keys_claim(devices_by_user)
         except Exception as e:
             print(f"[{self.name}] bootstrap keys_claim failed: {e}")
+
+        # Forsируем создание исходящей megolm-сессии в каждой комнате.
+        # nio при этом отправит m.room_key olm-encrypted всем участникам — это и есть
+        # тот самый «свежий prekey», от которого Element перетряхнёт свои olm-сессии.
+        for rid, room in encrypted_rooms:
+            try:
+                resp = await self.client.share_group_session(
+                    rid, ignore_unverified_devices=True
+                )
+                cls = type(resp).__name__
+                print(f"[{self.name}] share_group_session({rid[:20]}...): {cls}")
+            except Exception as e:
+                print(f"[{self.name}] share_group_session({rid[:20]}...) failed: {e}")
 
     def main(self) -> None:
         """Удобный entry-point: asyncio.run(self.run()) с обработкой Ctrl+C."""
