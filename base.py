@@ -246,13 +246,39 @@ class MatrixBot:
             )
         self._save_session(response)
 
+    def _restore_session_only(self, config: AsyncClientConfig) -> bool:
+        """Восстановить клиента из session.json без вызова login() — olm-state
+        в store/ остаётся нетронутым, верификация устройства сохраняется.
+        Возвращает True при успехе, False если session.json отсутствует/битый."""
+        if not (os.path.exists(self.session_path) and os.path.getsize(self.session_path) > 0):
+            return False
+        try:
+            with open(self.session_path) as f:
+                session = json.load(f)
+        except Exception as e:
+            print(f"[{self.name}] session.json битый ({e})")
+            return False
+        self.client = AsyncClient(
+            self.homeserver,
+            session["user_id"],
+            device_id=session["device_id"],
+            store_path=self.store_path,
+            config=config,
+        )
+        self.client.access_token = session["access_token"]
+        self.client.user_id = session["user_id"]
+        self.client.device_id = session["device_id"]
+        print(f"[{self.name}] восстановлена сессия из {self.session_path} (без re-login)")
+        return True
+
     async def run(self) -> None:
         config = AsyncClientConfig(store_sync_tokens=True, encryption_enabled=True)
 
-        # Стратегия: всегда делаем свежий логин (он переиспользует device_id из
-        # session.json, так что устройство на homeserver стабильно). Это надёжнее,
-        # чем пытаться валидировать старый access_token — homeserver мог его рециклить.
-        await self._login_fresh(config)
+        # Если есть session.json — восстанавливаем сессию БЕЗ login, чтобы сохранить
+        # olm-state в store/ и верификацию устройства в Element.
+        # При первом запуске или если session.json удалён вручную — fresh login.
+        if not self._restore_session_only(config):
+            await self._login_fresh(config)
 
         # Диагностика E2EE.
         olm = getattr(self.client, "olm", None)
@@ -292,8 +318,23 @@ class MatrixBot:
 
         # Делаем один начальный sync, чтобы получить список комнат и членов.
         # full_state=True заполняет device_store через первые keys_query.
+        # Если восстановленный токен мёртв — фоллбэк на свежий login.
         print(f"[{self.name}] первый sync...")
-        await self.client.sync(timeout=10000, full_state=True)
+        first_sync = await self.client.sync(timeout=10000, full_state=True)
+        from nio import SyncError
+        if isinstance(first_sync, SyncError):
+            print(f"[{self.name}] первый sync провалился ({first_sync}), пере-логин...")
+            await self.client.close()
+            await self._login_fresh(config)
+            if self.client.should_upload_keys:
+                await self.client.keys_upload()
+            # Перерегистрация callbacks — новый client.
+            self.client.add_event_callback(self._invite_callback, InviteEvent)
+            self.client.add_event_callback(self._undecryptable_callback, MegolmEvent)
+            self.client.add_event_callback(self._device_verification_callback, (KeyVerificationEvent,))
+            self.client.add_to_device_callback(self._device_verification_callback, (ToDeviceEvent,))
+            await self.on_start()
+            await self.client.sync(timeout=10000, full_state=True)
 
         # Bootstrap olm-сессий со всеми членами E2EE-комнат. Это лечит «протухшие»
         # olm-сессии после ребута: новые keys_claim создают свежую сессию, и Element
