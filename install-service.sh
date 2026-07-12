@@ -73,6 +73,7 @@ Wants=network-online.target
 Type=simple
 User=$BOT_USER
 WorkingDirectory=$BOT_DIR
+Environment=PYTHONUNBUFFERED=1
 ExecStart=$VENV_DIR/bin/python $BOT_DIR/bot.py
 Restart=on-failure
 RestartSec=10

@@ -104,8 +104,10 @@ class MatrixBot:
         try:
             await self.client.keys_query()
         except Exception as e:
-            print(f"[{self.name}] keys_query({user_id}) failed: {e}")
-            return
+            # "No key query required." — nio считает список устройств уже
+            # актуальным, это не ошибка. Продолжаем к keys_claim: именно он
+            # пересоздаёт сломанную olm-сессию, а не keys_query.
+            print(f"[{self.name}] keys_query({user_id}): {e} (не критично, продолжаю)")
         device_ids = self._devices_of(user_id)
         if not device_ids:
             return
@@ -301,8 +303,13 @@ class MatrixBot:
 
         # Принудительный keys_upload — даже если should_upload_keys=False, на всякий случай.
         # Иначе Element видит сессию как «not E2EE» и не даёт верифицировать.
+        # Если nio думает что device keys уже залиты, но Element их не видит —
+        # сбрасываем флаг account.shared чтобы re-upload включил identity keys в payload.
         should = getattr(self.client, "should_upload_keys", None)
         print(f"[{self.name}] should_upload_keys={should}")
+        if olm is not None and getattr(olm.account, "shared", False):
+            print(f"[{self.name}] FORCE re-upload device keys (сбрасываю account.shared)")
+            olm.account.shared = False
         try:
             resp = await self.client.keys_upload()
             if isinstance(resp, KeysUploadError):
